@@ -1,0 +1,884 @@
+// Referral & Reward Program Platform — Prisma schema
+// Derived from BRD.md. See BRD.md for the authoritative business rules.
+
+generator client {
+  provider = "prisma-client-js"
+}
+
+datasource db {
+  provider  = "postgresql"
+  url       = env("DATABASE_URL")
+  directUrl = env("DIRECT_URL")
+}
+
+// ---------------------------------------------------------------------------
+// Enums
+// ---------------------------------------------------------------------------
+
+enum Role {
+  ADMIN
+  USER
+}
+
+enum PlanStatus {
+  ACTIVE
+  DISCONTINUED
+}
+
+enum PaymentFrequency {
+  MONTHLY
+  LUMPSUM
+}
+
+// BRD Rule XLVIII: admin-managed payment duration/cadence list. Month is the
+// largest unit — a cadence never escalates across units, only numeric steps
+// within one unit (e.g. "Every 7 Day", "Every 2 Week", "Every 3 Month").
+enum CadenceUnit {
+  DAY
+  WEEK
+  MONTH
+}
+
+enum InterestFormulaType {
+  SIMPLE
+  COMPOUND
+  CUSTOM
+}
+
+enum UserPlanStatus {
+  ACTIVE
+  MATURED
+  DISCONTINUED
+  PARTIALLY_REDEEMED
+  REDEEMED
+}
+
+enum PaymentStatus {
+  INITIATED
+  PENDING
+  SUCCESS
+  FAILED
+  RETRYING
+}
+
+enum PaymentMethod {
+  CARD
+  UPI
+  NETBANKING
+  WALLET
+}
+
+enum MandateStatus {
+  CREATED
+  ACTIVE
+  EXPIRED
+  CANCELLED
+}
+
+enum LedgerTransactionType {
+  PLAN_PAYMENT
+  INTEREST
+  COMMISSION
+  REDEMPTION_COURSE
+  REDEMPTION_REFUND
+  REDEMPTION_REINVESTMENT
+  REDEMPTION_DONATION
+  REDEMPTION_FRANCHISEE
+  REDEMPTION_GADGETS
+}
+
+enum ReferralStatus {
+  ACTIVE
+  CANCELLED
+  EXPIRED
+}
+
+enum CommissionType {
+  RECURRING
+  ONE_TIME
+}
+
+enum CommissionStatus {
+  ACCRUED
+  APPROVED
+  CREDITED
+  AVAILABLE_FOR_WITHDRAWAL
+  WITHDRAWN
+  NOT_ACCRUED
+}
+
+enum RedemptionCategory {
+  COURSE
+  REFUND
+  REINVESTMENT
+  DONATION
+  FRANCHISEE
+  GADGETS
+}
+
+enum RedemptionStatus {
+  PENDING
+  AWAITING_SHORTFALL_RESOLUTION
+  APPROVED
+  REJECTED
+  CANCELLED
+  EXPIRED
+}
+
+enum NotificationType {
+  REGISTRATION
+  PAYMENT_SUCCESS
+  PAYMENT_FAILURE
+  PLAN_MATURITY
+  REFERRAL_EARNED
+  REFUND_PROCESSED
+  ADMIN_MESSAGE
+  PROMOTIONAL
+  INSTALMENT_REMINDER
+  GENERAL_ENQUIRY_RECEIVED
+}
+
+enum EmailStatus {
+  QUEUED
+  SENT
+  FAILED
+}
+
+// ---------------------------------------------------------------------------
+// Users, auth, referral
+// ---------------------------------------------------------------------------
+
+model User {
+  id              String   @id @default(cuid())
+  email           String   @unique
+  passwordHash    String?
+  mobileNumber    String?
+  role            Role     @default(USER)
+  referralCode    String   @unique
+  referralCodeActive Boolean @default(true)
+  isEmailVerified Boolean  @default(false)
+  failedLoginCount Int     @default(0)
+  lockedUntil     DateTime?
+  // BRD Rule XLII: push (FCM/OS) delivery opt-out. Never gates the durable
+  // Notification DB row/in-app history — only the FCM send step.
+  pushNotificationsEnabled Boolean @default(true)
+  createdAt       DateTime @default(now())
+  updatedAt       DateTime @updatedAt
+
+  socialAccounts     SocialAccount[]
+  refreshTokens      RefreshToken[]
+  pushSubscriptions  PushSubscription[]
+  otpCodes           OtpCode[]
+  userPlans          UserPlan[]
+  ledgerEntries      LedgerEntry[]        @relation("LedgerOwner")
+  approvedLedgerEntries LedgerEntry[]     @relation("LedgerApprover")
+  referralsMade      Referral[]           @relation("Referrer")
+  referralsReceived  Referral[]           @relation("Referred")
+  redemptionRequests RedemptionRequest[]
+  franchiseeEnquiries FranchiseeRedemptionEnquiry[]
+  generalEnquiriesSubmitted GeneralEnquiry[] @relation("GeneralEnquirySubmitter")
+  generalEnquiriesResolved  GeneralEnquiry[] @relation("GeneralEnquiryResolver")
+  notifications      Notification[]
+  auditLogs          AuditLog[]
+  loginHistory       LoginHistory[]
+  rewardPointsBalance Int @default(0)
+  themeConfigsCreated   ThemeConfig[] @relation("ThemeCreator")
+  themeConfigsPublished ThemeConfig[] @relation("ThemePublisher")
+
+  @@index([referralCode])
+}
+
+model SocialAccount {
+  id         String   @id @default(cuid())
+  userId     String
+  user       User     @relation(fields: [userId], references: [id])
+  provider   String
+  providerAccountId String
+  createdAt  DateTime @default(now())
+
+  @@unique([provider, providerAccountId])
+  @@index([userId])
+}
+
+model RefreshToken {
+  id          String   @id @default(cuid())
+  userId      String
+  user        User     @relation(fields: [userId], references: [id])
+  tokenHash   String   @unique
+  expiresAt   DateTime
+  revokedAt   DateTime?
+  replacedByTokenHash String?
+  // "Remember me" was checked at login: this token (and every token it is
+  // rotated into) uses the long-lived TTL instead of the default 30 days.
+  remembered  Boolean  @default(false)
+  createdAt   DateTime @default(now())
+
+  @@index([userId])
+}
+
+// Master Prompt.md §27: FCM registration model — one row per browser/device
+// installation. A user/admin may hold multiple valid registrations
+// (§31 multi-device); `revokedAt` marks a registration inactive (stale
+// token, permission revoked, or 404/"not registered" from FCM — see
+// src/lib/push/fcm.ts) without deleting delivery history.
+model PushSubscription {
+  id         String    @id @default(cuid())
+  userId     String
+  user       User      @relation(fields: [userId], references: [id])
+  fcmToken   String    @unique
+  platform   String?
+  userAgent  String?
+  lastError  String?
+  revokedAt  DateTime?
+  createdAt  DateTime  @default(now())
+  updatedAt  DateTime  @updatedAt
+
+  @@index([userId])
+}
+
+model OtpCode {
+  id        String   @id @default(cuid())
+  userId    String
+  user      User     @relation(fields: [userId], references: [id])
+  purpose   String // LOGIN_2FA, EMAIL_VERIFY, PASSWORD_RESET
+  codeHash  String
+  expiresAt DateTime
+  attempts  Int      @default(0)
+  consumedAt DateTime?
+  createdAt DateTime @default(now())
+
+  @@index([userId, purpose])
+}
+
+// Design.md 3.2 [BRD-required]: Recent Logins / Device Sessions must show
+// both successful and failed login attempts with a result/status. A FAILED
+// row never starts an authenticated session (logoutAt/session concepts only
+// apply to SUCCESS rows).
+enum LoginResult {
+  SUCCESS
+  FAILED
+}
+
+model LoginHistory {
+  id        String      @id @default(cuid())
+  userId    String
+  user      User        @relation(fields: [userId], references: [id])
+  result    LoginResult @default(SUCCESS)
+  loginAt   DateTime    @default(now())
+  logoutAt  DateTime?
+  ipAddress String?
+  userAgent String?
+
+  @@index([userId])
+}
+
+// ---------------------------------------------------------------------------
+// Plans & interest engine
+// ---------------------------------------------------------------------------
+
+model InterestCalculationMethod {
+  id                  String              @id @default(cuid())
+  name                String
+  formulaType         InterestFormulaType
+  ratePercent         Decimal             @db.Decimal(6, 2)
+  tenureMonths        Int
+  compoundingFrequency String?
+  customFormula       String?
+  dayCountBasis       String              @default("ACTUAL_365")
+  version             Int                 @default(1)
+  // BRD Interest Calculation Method rule (e): editing a method never mutates
+  // an existing row (already-enrolled Plans/UserPlans keep their FK to it,
+  // which is what makes their snapshot immutable) — an edit instead creates a
+  // new row and retires this one via `active`.
+  active              Boolean             @default(true)
+  previousVersionId   String?             @unique
+  previousVersion     InterestCalculationMethod?  @relation("MethodVersionHistory", fields: [previousVersionId], references: [id])
+  nextVersion         InterestCalculationMethod?  @relation("MethodVersionHistory")
+  createdAt           DateTime            @default(now())
+
+  plans     Plan[]
+  userPlans UserPlan[]
+}
+
+model Plan {
+  id                     String     @id @default(cuid())
+  name                   String
+  tenureMonths           Int
+  paymentFrequency       PaymentFrequency
+  presetAmounts          Decimal[]  @db.Decimal(12, 2)
+  // BRD Rule XLVIII: admin-managed list of recurring cadences offered on this
+  // plan, e.g. [{"unit":"MONTH","interval":1},{"unit":"WEEK","interval":2}].
+  // Only meaningful when paymentFrequency is MONTHLY (recurring) — LUMPSUM
+  // plans stay a single one-time payment (Drafted Clarification — pending
+  // client confirmation, see BRD Rule XLVIII(d)). Defaults to the single
+  // "Every 1 Month" cadence so pre-existing plans behave exactly as before.
+  paymentCadences        Json       @default("[{\"unit\":\"MONTH\",\"interval\":1}]")
+  interestMethodId       String
+  interestMethod         InterestCalculationMethod @relation(fields: [interestMethodId], references: [id])
+  rewardPercent          Decimal?   @db.Decimal(5, 2)
+  commissionPercent      Decimal    @db.Decimal(5, 2)
+  status                 PlanStatus @default(ACTIVE)
+  configVersion          Int        @default(1)
+  createdAt              DateTime   @default(now())
+  updatedAt              DateTime   @updatedAt
+
+  userPlans UserPlan[]
+  reinvestmentTargets RedemptionRequest[] @relation("ReinvestmentTargetPlan")
+}
+
+model UserPlan {
+  id                        String          @id @default(cuid())
+  userId                    String
+  user                      User            @relation(fields: [userId], references: [id])
+  planId                    String
+  plan                      Plan            @relation(fields: [planId], references: [id])
+  interestMethodId          String
+  interestMethod            InterestCalculationMethod @relation(fields: [interestMethodId], references: [id])
+  interestMethodVersion     Int
+  rewardPercentSnapshot     Decimal?        @db.Decimal(5, 2)
+  commissionPercentSnapshot Decimal         @db.Decimal(5, 2)
+  paymentAmount             Decimal         @db.Decimal(12, 2)
+  paymentFrequency          PaymentFrequency
+  // BRD Rules XVI/XLVIII(e): snapshot of the cadence selected at subscribe
+  // time from the Plan's paymentCadences list — later admin edits to the
+  // Plan's list never retroactively change an existing UserPlan's cadence.
+  cadenceUnit               CadenceUnit     @default(MONTH)
+  cadenceInterval           Int             @default(1)
+  // Design.md 5.13 payment-method-change requirement: applies only to
+  // scheduled payments not yet processed — never rewrites amount, frequency,
+  // already-paid principal, or accrued interest on this row.
+  preferredPaymentMethod    PaymentMethod   @default(UPI)
+  status                    UserPlanStatus  @default(ACTIVE)
+  principalPaid             Decimal         @default(0) @db.Decimal(14, 2)
+  remainingUnpaidPrincipal  Decimal         @default(0) @db.Decimal(14, 2)
+  startDate                 DateTime        @default(now())
+  maturityDate              DateTime
+  createdAt                 DateTime        @default(now())
+  updatedAt                 DateTime        @updatedAt
+
+  payments  Payment[]
+  mandates  PaymentMandate[]
+  ledgerEntries LedgerEntry[]
+  commissions Commission[]
+
+  @@index([userId])
+  @@index([planId])
+}
+
+// ---------------------------------------------------------------------------
+// Payments (simulated Razorpay AutoPay)
+// ---------------------------------------------------------------------------
+
+model PaymentMandate {
+  id             String        @id @default(cuid())
+  userPlanId     String
+  userPlan       UserPlan      @relation(fields: [userPlanId], references: [id])
+  gatewayMandateId String      @unique
+  status         MandateStatus @default(CREATED)
+  createdAt      DateTime      @default(now())
+  updatedAt      DateTime      @updatedAt
+
+  payments Payment[]
+
+  @@index([userPlanId])
+}
+
+model Payment {
+  id               String        @id @default(cuid())
+  userPlanId       String
+  userPlan         UserPlan      @relation(fields: [userPlanId], references: [id])
+  mandateId        String?
+  mandate          PaymentMandate? @relation(fields: [mandateId], references: [id])
+  idempotencyKey   String        @unique
+  gatewayOrderId   String        @unique
+  gatewayPaymentId String?       @unique
+  status           PaymentStatus @default(INITIATED)
+  amount           Decimal       @db.Decimal(12, 2)
+  method           PaymentMethod @default(UPI)
+  retryCount       Int           @default(0)
+  scheduledDate    DateTime
+  actualDate       DateTime?
+  // BRD Rule XXVII: grace period runs from scheduledDate; nextRetryAt is when
+  // the next automatic retry attempt is due; manualWindowEndsAt is set only
+  // once automatic recovery ends (retries exhausted or grace period expired)
+  // and marks the deadline for the user to complete the instalment manually.
+  gracePeriodEndsAt   DateTime?
+  nextRetryAt         DateTime?
+  manualWindowEndsAt  DateTime?
+  createdAt        DateTime      @default(now())
+  updatedAt        DateTime      @updatedAt
+
+  events    PaymentEvent[]
+  ledgerEntries LedgerEntry[]
+  commissions Commission[]
+
+  @@index([userPlanId])
+}
+
+// Admin-configurable BRD parameters (Rule XXVII grace period/retry/manual
+// window, referral validity, redemption expiry, commission cycle length,
+// common reward percent). Key-value so new settings don't need a migration.
+model SiteSetting {
+  key       String   @id
+  value     String
+  updatedAt DateTime @updatedAt
+}
+
+model PaymentEvent {
+  id               String   @id @default(cuid())
+  paymentId        String
+  payment          Payment  @relation(fields: [paymentId], references: [id])
+  eventType        String
+  gatewayEventId   String   @unique
+  signatureVerified Boolean
+  rawPayload       Json
+  processedAt      DateTime @default(now())
+
+  @@index([paymentId])
+}
+
+// ---------------------------------------------------------------------------
+// Ledger
+// ---------------------------------------------------------------------------
+
+model LedgerEntry {
+  id                  String                @id @default(cuid())
+  userId              String
+  user                User                  @relation("LedgerOwner", fields: [userId], references: [id])
+  userPlanId          String?
+  userPlan            UserPlan?             @relation(fields: [userPlanId], references: [id])
+  paymentId           String?
+  payment             Payment?              @relation(fields: [paymentId], references: [id])
+  transactionType     LedgerTransactionType
+  amount              Decimal               @db.Decimal(14, 2)
+  balanceBefore       Decimal               @db.Decimal(14, 2)
+  balanceAfter        Decimal               @db.Decimal(14, 2)
+  referrerUserId      String?
+  commissionId        String?
+  approverUserId      String?
+  approver            User?                 @relation("LedgerApprover", fields: [approverUserId], references: [id])
+  approvalTimestamp   DateTime?
+  description         String
+  interestMethodId    String?
+  interestMethodVersion Int?
+  transactionTimestamp DateTime             @default(now())
+
+  @@index([userId])
+}
+
+// ---------------------------------------------------------------------------
+// Referral & commission
+// ---------------------------------------------------------------------------
+
+model Referral {
+  id                String         @id @default(cuid())
+  referrerUserId    String
+  referrer          User           @relation("Referrer", fields: [referrerUserId], references: [id])
+  referredUserId    String         @unique
+  referred          User           @relation("Referred", fields: [referredUserId], references: [id])
+  referralCodeUsed  String
+  status            ReferralStatus @default(ACTIVE)
+  expiryDate        DateTime
+  cancellationReason String?
+  cancelledBy       String?
+  cancelledAt       DateTime?
+  createdAt         DateTime       @default(now())
+
+  commissions Commission[]
+
+  @@index([referrerUserId])
+}
+
+model Commission {
+  id             String            @id @default(cuid())
+  referralId     String
+  referral       Referral          @relation(fields: [referralId], references: [id])
+  userPlanId     String?
+  userPlan       UserPlan?         @relation(fields: [userPlanId], references: [id])
+  paymentId      String?
+  payment        Payment?          @relation(fields: [paymentId], references: [id])
+  amount         Decimal           @db.Decimal(12, 2)
+  status         CommissionStatus  @default(ACCRUED)
+  commissionType CommissionType
+  cyclePosition  Int?
+  accrualDate    DateTime          @default(now())
+  approvalDate   DateTime?
+  creditDate     DateTime?
+  withdrawalDate DateTime?
+
+  @@index([referralId])
+}
+
+// ---------------------------------------------------------------------------
+// Redemption catalogue & requests
+// ---------------------------------------------------------------------------
+
+model University {
+  id      String   @id @default(cuid())
+  name    String   @unique
+  courses Course[]
+}
+
+// BRD "Donation Processing": Admin-curated list of eligible donation
+// recipients/entities a user selects from when submitting a donation
+// request. `active` lets Admin retire a recipient from future selection
+// without breaking the FK on historical requests.
+model DonationRecipient {
+  id       String              @id @default(cuid())
+  name     String              @unique
+  active   Boolean             @default(true)
+  requests RedemptionRequest[]
+}
+
+model Course {
+  id           String   @id @default(cuid())
+  universityId String
+  university   University @relation(fields: [universityId], references: [id])
+  name         String
+  fee          Decimal  @db.Decimal(12, 2)
+
+  @@index([universityId])
+}
+
+model GadgetItem {
+  id               String  @id @default(cuid())
+  category         String
+  name             String
+  price            Decimal @db.Decimal(12, 2)
+  stockQuantity    Int
+  reservedQuantity Int     @default(0)
+
+  redemptionLines RedemptionGadgetItem[]
+}
+
+model College {
+  id   String @id @default(cuid())
+  name String @unique
+
+  franchiseeMappings FranchiseePlanCollegeMapping[]
+  enquiries FranchiseeRedemptionEnquiry[]
+}
+
+model FranchiseePlan {
+  id                     String  @id @default(cuid())
+  name                   String
+  oneTimeDeductiblePrice Decimal @db.Decimal(12, 2)
+
+  collegeMappings FranchiseePlanCollegeMapping[]
+  enquiries FranchiseeRedemptionEnquiry[]
+}
+
+model FranchiseePlanCollegeMapping {
+  franchiseePlanId String
+  franchiseePlan   FranchiseePlan @relation(fields: [franchiseePlanId], references: [id])
+  collegeId        String
+  college          College        @relation(fields: [collegeId], references: [id])
+
+  @@id([franchiseePlanId, collegeId])
+}
+
+model FranchiseeRedemptionEnquiry {
+  id                String            @id @default(cuid())
+  userId            String
+  user              User              @relation(fields: [userId], references: [id])
+  franchiseePlanId  String
+  franchiseePlan    FranchiseePlan    @relation(fields: [franchiseePlanId], references: [id])
+  collegeId         String
+  college           College           @relation(fields: [collegeId], references: [id])
+  status            RedemptionStatus  @default(PENDING)
+  requestedAmount   Decimal           @db.Decimal(12, 2)
+  availableMarginAtRequest Decimal    @db.Decimal(14, 2)
+  shortfallAmount   Decimal           @default(0) @db.Decimal(12, 2)
+  shortfallReference String?
+  shortfallVerifiedBy String?
+  shortfallVerifiedAt DateTime?
+  expiresAt         DateTime
+  createdAt         DateTime          @default(now())
+  updatedAt         DateTime          @updatedAt
+
+  @@index([userId])
+}
+
+model RedemptionRequest {
+  id                String             @id @default(cuid())
+  userId            String
+  user              User               @relation(fields: [userId], references: [id])
+  category          RedemptionCategory
+  status            RedemptionStatus   @default(PENDING)
+  requestedAmount   Decimal            @db.Decimal(12, 2)
+  availableMarginAtRequest Decimal     @db.Decimal(14, 2)
+  shortfallAmount   Decimal            @default(0) @db.Decimal(12, 2)
+  reservedAmount    Decimal            @default(0) @db.Decimal(12, 2)
+  shortfallReference String?
+  shortfallVerifiedBy String?
+  shortfallVerifiedAt DateTime?
+  relatedCourseId   String?
+  // BRD Rule XIII: Reward Points automatically applied toward this request's
+  // course fee at request time (reserved), spent at approval. Always 0 for
+  // non-COURSE categories.
+  rewardPointsApplied Int              @default(0)
+  // Design.md 3.11 [BRD-required]: Reinvestment must let the user select a
+  // target plan for the amount being reinvested — snapshotted here so an
+  // Admin approval knows which plan to enrol the approved amount into.
+  targetPlanId      String?
+  targetPlan        Plan?              @relation("ReinvestmentTargetPlan", fields: [targetPlanId], references: [id])
+  // BRD "Donation Processing": recipient/entity the user selected (from the
+  // Admin-curated DonationRecipient list), the user's consent to offline
+  // processing, and the system-generated transaction reference recorded at
+  // approval time. receiptGeneratedAt records the first time the donation
+  // receipt PDF was generated (satisfies "receipt ... generated or
+  // recorded"). All null/false for non-DONATION categories.
+  donationRecipientId String?
+  donationRecipient   DonationRecipient? @relation(fields: [donationRecipientId], references: [id])
+  consentGiven        Boolean            @default(false)
+  consentGivenAt      DateTime?
+  donationReference   String?
+  receiptGeneratedAt  DateTime?
+  comments          String?
+  expiresAt         DateTime
+  createdAt         DateTime           @default(now())
+  updatedAt         DateTime           @updatedAt
+  statusEvents      RedemptionStatusEvent[]
+  // Design.md 3.13 [BRD-required]: Gadgets & Accessories is a multi-select
+  // cart, not a single item — one line per selected item/quantity.
+  gadgetItems       RedemptionGadgetItem[]
+
+  @@index([userId])
+}
+
+// Design.md 3.13: one cart line per gadget/quantity selected in a GADGETS
+// redemption request. priceAtRequest snapshots the catalogue price at
+// request time so a later catalogue price change never rewrites an existing
+// request's total.
+model RedemptionGadgetItem {
+  id                  String            @id @default(cuid())
+  redemptionRequestId String
+  redemptionRequest   RedemptionRequest @relation(fields: [redemptionRequestId], references: [id], onDelete: Cascade)
+  gadgetItemId        String
+  gadgetItem          GadgetItem        @relation(fields: [gadgetItemId], references: [id])
+  quantity            Int
+  priceAtRequest      Decimal           @db.Decimal(12, 2)
+  createdAt           DateTime          @default(now())
+
+  @@index([redemptionRequestId])
+  @@index([gadgetItemId])
+}
+
+// Design.md 3.7 [BRD-required]: the Redeem Hub's expanded request detail
+// must show a status timeline. RedemptionRequest only ever stores the
+// *current* status, so this table captures every transition plus an
+// optional admin-authored note — the same note also satisfies the "Admin
+// concern/message where one was raised" requirement (e.g. a reject reason),
+// without needing a separate ephemeral-notification-only mechanism.
+model RedemptionStatusEvent {
+  id                  String            @id @default(cuid())
+  redemptionRequestId String
+  redemptionRequest   RedemptionRequest @relation(fields: [redemptionRequestId], references: [id], onDelete: Cascade)
+  status              RedemptionStatus
+  note                String?
+  actorUserId         String?
+  createdAt           DateTime          @default(now())
+
+  @@index([redemptionRequestId])
+}
+
+enum GeneralEnquiryStatus {
+  NEW
+  IN_PROGRESS
+  RESOLVED
+}
+
+// BRD Rule XXXIX / Design.md 1.5, 5.8: General Enquiry is a communications/
+// business-support record, functionally and financially distinct from
+// RedemptionRequest and FranchiseeRedemptionEnquiry above (Rule XXXIX.10) —
+// never merged with either lifecycle and has no financial/ledger effect.
+model GeneralEnquiry {
+  id             String               @id @default(cuid())
+  userId         String?
+  user           User?                @relation("GeneralEnquirySubmitter", fields: [userId], references: [id])
+  name           String
+  email          String
+  phone          String?
+  message        String
+  status         GeneralEnquiryStatus @default(NEW)
+  source         String               @default("CONTACT_PAGE")
+  ipAddress      String?
+  adminComment   String?
+  resolvedAt     DateTime?
+  resolvedById   String?
+  resolvedBy     User?                @relation("GeneralEnquiryResolver", fields: [resolvedById], references: [id])
+  createdAt      DateTime             @default(now())
+  updatedAt      DateTime             @updatedAt
+  // BRD Rule XXXIX.8: retention-driven PII anonymization (controlled, audited
+  // action) once a record passes the configurable retention window. The row
+  // itself is never deleted, so reporting continuity/aggregate counts are
+  // preserved; name/email/phone are irreversibly redacted in place.
+  anonymizedAt   DateTime?
+
+  @@index([userId])
+  @@index([status])
+  @@index([email])
+}
+
+// Design.md 1.4 / 5.13.C, E: About Us is a repeatable, reorderable, admin-
+// authored section list with an explicit Save Draft / Preview / Publish
+// workflow. Draft and Published are two entirely separate tables (not a
+// status flag on one table) so an in-progress edit can never leak onto the
+// public page — Publish is a single transaction that replaces every
+// AboutUsSectionPublished row with a snapshot of the current
+// AboutUsSectionDraft rows.
+model AboutUsSectionDraft {
+  id        String   @id @default(cuid())
+  heading   String?
+  body      String
+  order     Int
+  updatedAt DateTime @updatedAt
+
+  @@index([order])
+}
+
+model AboutUsSectionPublished {
+  id          String   @id @default(cuid())
+  heading     String?
+  body        String
+  order       Int
+  publishedAt DateTime @default(now())
+
+  @@index([order])
+}
+
+// Design.md 1.5 / 5.13.D, E: Contact Us content is a small, fixed set of
+// scalar fields (never a repeatable list), so a single singleton row with
+// parallel draft*/published* columns is sufficient to keep the same
+// draft-never-affects-public guarantee as About Us without a second table.
+model ContactUsContent {
+  id                   String    @id @default(cuid())
+  draftAddress         String?
+  draftPhone           String?
+  draftEmail           String?
+  draftWebsite         String?
+  draftSocialLinks     Json?
+  publishedAddress     String?
+  publishedPhone       String?
+  publishedEmail       String?
+  publishedWebsite     String?
+  publishedSocialLinks Json?
+  publishedAt          DateTime?
+  updatedAt            DateTime  @updatedAt
+}
+
+// ---------------------------------------------------------------------------
+// Notifications, email, audit
+// ---------------------------------------------------------------------------
+
+model Notification {
+  id              String           @id @default(cuid())
+  userId          String
+  user            User             @relation(fields: [userId], references: [id])
+  type            NotificationType
+  title           String
+  message         String
+  isRead          Boolean          @default(false)
+  readAt          DateTime?
+  relatedEntityRef String?
+  createdAt       DateTime         @default(now())
+
+  @@index([userId])
+}
+
+model EmailMessage {
+  id              String      @id @default(cuid())
+  recipient       String
+  subject         String
+  body            String
+  templateType    String
+  status          EmailStatus @default(QUEUED)
+  relatedEntityRef String?
+  createdAt       DateTime    @default(now())
+
+  @@index([recipient])
+}
+
+model AuditLog {
+  id           String   @id @default(cuid())
+  actorUserId  String?
+  actor        User?    @relation(fields: [actorUserId], references: [id])
+  eventType    String
+  entityRef    String?
+  details      Json?
+  timestamp    DateTime @default(now())
+
+  @@index([actorUserId])
+  @@index([eventType])
+}
+
+// ---------------------------------------------------------------------------
+// Admin website theme / branding management
+// ---------------------------------------------------------------------------
+
+enum ThemeStatus {
+  DRAFT
+  PUBLISHED
+  ARCHIVED
+}
+
+model ThemeConfig {
+  id      String      @id @default(cuid())
+  version Int
+  status  ThemeStatus
+
+  // Branding
+  appName            String?
+  logoUrl            String?
+  loginLogoUrl       String?
+  faviconUrl         String?
+  loginTitle         String?
+  loginSubtitle      String?
+  welcomeText        String?
+  primaryButtonLabel String?
+  supportText        String?
+  footerText         String?
+
+  // Login wallpaper
+  loginBackgroundType     String  @default("SOLID") // IMAGE | GRADIENT | SOLID
+  loginBackgroundUrl      String?
+  loginBackgroundPosition String  @default("CENTER")
+  loginBackgroundSize     String  @default("COVER")
+  loginOverlayEnabled     Boolean @default(false)
+  loginOverlayColor       String  @default("#000000")
+  loginOverlayOpacity     Int     @default(40) // 0-100
+
+  // Colors (hex strings, validated server-side)
+  primaryColor       String @default("#000000")
+  onPrimaryColor     String @default("#ffffff")
+  secondaryColor     String @default("#006c4a")
+  onSecondaryColor   String @default("#ffffff")
+  backgroundColor    String @default("#fbf8fc")
+  surfaceColor       String @default("#f0edf1")
+  cardColor          String @default("#ffffff")
+  textPrimaryColor   String @default("#1b1b1e")
+  textSecondaryColor String @default("#47464a")
+  successColor       String @default("#006c4a")
+  warningColor       String @default("#c76c00")
+  errorColor         String @default("#ba1a1a")
+  infoColor          String @default("#0b57d0")
+  borderColor        String @default("#c8c5ca")
+
+  // Typography / style
+  fontFamily         String @default("inter")
+  headingFontFamily  String @default("jakarta")
+  baseFontSize       Int    @default(16) // px, 14-18
+  borderRadiusPreset String @default("standard") // sharp | standard | rounded
+  themeMode          String @default("LIGHT") // LIGHT (DARK/SYSTEM reserved)
+
+  createdBy       String?
+  createdByUser   User?    @relation("ThemeCreator", fields: [createdBy], references: [id])
+  publishedBy     String?
+  publishedByUser User?    @relation("ThemePublisher", fields: [publishedBy], references: [id])
+  createdAt       DateTime @default(now())
+  updatedAt       DateTime @updatedAt
+  publishedAt     DateTime?
+
+  @@index([status])
+  @@index([version])
+}

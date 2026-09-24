@@ -12,6 +12,10 @@ const eslintConfig = defineConfig([
     "out/**",
     "build/**",
     "next-env.d.ts",
+    // Generated Playwright HTML report/trace-viewer bundle — not source code.
+    "playwright-report/**",
+    // Non-destructive pre-edit snapshots kept for rollback — not source code.
+    "backups/**",
   ]),
 ]);
 

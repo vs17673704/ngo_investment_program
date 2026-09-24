@@ -3,6 +3,9 @@
 # dependencies
 /node_modules
 /.pnp
+/.claude
+/artifacts
+*agent*
 .pnp.*
 .yarn/*
 !.yarn/patches
@@ -12,6 +15,11 @@
 
 # testing
 /coverage
+/test-results/
+/playwright-report/
+/blob-report/
+/playwright/.cache/
+/tests/browser/artifacts/
 
 # next.js
 /.next/
@@ -29,9 +37,15 @@ npm-debug.log*
 yarn-debug.log*
 yarn-error.log*
 .pnpm-debug.log*
+*back*.log
+CHANGE_PROGRESS.md
+/*.log
 
 # env files (can opt-in for committing if needed)
 .env*
+
+# real Firebase service-account credentials (server-side secret, never committed)
+/firebase_prerequisites
 
 # vercel
 .vercel
@@ -39,3 +53,14 @@ yarn-error.log*
 # typescript
 *.tsbuildinfo
 next-env.d.ts
+
+/src/generated/prisma
+
+certificates
+
+# scratch / reference material (not read by the app at build or runtime)
+/backups/
+/audit_scratch/
+/stitch_design/
+/docs/
+/prompts/
