@@ -1,0 +1,496 @@
+openapi: 3.0.3
+info:
+  title: NGO Investment Program — Route Handler API
+  description: >-
+    OpenAPI documentation for the REST route handlers under `src/app/api/`.
+    This project is primarily a Next.js Server-Actions application — most
+    user-facing mutations (plan subscription, redemptions, admin approvals,
+    etc.) are Server Actions invoked directly from React components and are
+    not HTTP-addressable, so they are intentionally not listed here. This
+    spec covers only the endpoints exposed as real route handlers
+    (`route.ts` files), which are the ones reachable from an external HTTP
+    client (file downloads, the refresh endpoint, push-subscription
+    management, the admin live-event stream, and the donation receipt
+    endpoint).
+  version: 0.1.0
+  contact:
+    name: NGO Investment Program
+servers:
+  - url: /
+    description: Same-origin (relative to wherever the app is deployed)
+tags:
+  - name: Auth
+    description: Session / refresh-token lifecycle
+  - name: Admin — Reports
+    description: Admin-only report and ledger exports (CSV/Excel/PDF)
+  - name: Admin — Live Events
+    description: Server-sent events stream for the admin console
+  - name: Push Notifications
+    description: Web Push (FCM) subscription management for the authenticated user
+  - name: Redemptions
+    description: Redemption-request artifacts (e.g. donation receipts)
+
+components:
+  securitySchemes:
+    sessionCookie:
+      type: apiKey
+      in: cookie
+      name: session_token
+      description: >-
+        RS256-signed JWT access token issued at login (after 2FA). Required
+        for every endpoint in this spec except `POST /api/auth/refresh`,
+        which instead reads the separate `refresh_token` cookie.
+    refreshCookie:
+      type: apiKey
+      in: cookie
+      name: refresh_token
+      description: >-
+        Opaque, single-use, rotating refresh token issued alongside the
+        session cookie. Only consumed by `POST /api/auth/refresh`.
+
+  schemas:
+    ErrorResponse:
+      type: object
+      properties:
+        error:
+          type: string
+      required: [error]
+      example:
+        error: Unauthorized
+
+    PushSubscribeRequest:
+      type: object
+      required: [fcmToken]
+      properties:
+        fcmToken:
+          type: string
+          minLength: 1
+          description: Firebase Cloud Messaging registration token for this device/browser.
+        platform:
+          type: string
+          maxLength: 100
+          description: Free-form client platform label (e.g. "web", "android").
+
+    PushUnsubscribeRequest:
+      type: object
+      required: [fcmToken]
+      properties:
+        fcmToken:
+          type: string
+          minLength: 1
+
+    PushStatusResponse:
+      type: object
+      properties:
+        enabled:
+          type: boolean
+          description: Whether the authenticated user currently has push notifications enabled.
+      required: [enabled]
+
+    PushSubscribeResponse:
+      type: object
+      properties:
+        ok:
+          type: boolean
+        disabled:
+          type: boolean
+          description: Present and true when the account has push notifications turned off; the token was not stored.
+      required: [ok]
+
+    OkResponse:
+      type: object
+      properties:
+        ok:
+          type: boolean
+      required: [ok]
+
+    RefreshSuccessResponse:
+      type: object
+      properties:
+        ok:
+          type: boolean
+          enum: [true]
+      required: [ok]
+
+    LedgerEntryRow:
+      type: object
+      properties:
+        id: { type: string }
+        userEmail: { type: string, format: email }
+        transactionType: { type: string }
+        amount: { type: string, description: Decimal amount, serialized as string in CSV. }
+        balanceBefore: { type: string }
+        balanceAfter: { type: string }
+        description: { type: string, nullable: true }
+        transactionTimestamp: { type: string, format: date-time }
+
+    AdminEvent:
+      type: object
+      description: >-
+        One Server-Sent Event payload, JSON-encoded in the SSE `data:` field.
+        The concrete shape varies by event type (see
+        `src/lib/events/admin-events.ts`); only a minimal envelope is
+        guaranteed.
+      properties:
+        type:
+          type: string
+          description: Discriminator for the kind of admin event (e.g. a new enquiry, a payment event, a redemption state change).
+      additionalProperties: true
+
+  parameters:
+    ReportKeyPath:
+      name: reportKey
+      in: path
+      required: true
+      description: Identifier of one of the 11 predefined admin reports.
+      schema:
+        type: string
+        enum:
+          - users
+          - payments
+          - interest
+          - referrals
+          - plans
+          - refunds
+          - rewards
+          - enquiries
+          - general-enquiries
+          - revenue
+          - audit
+    ReportFormatQuery:
+      name: format
+      in: query
+      required: false
+      description: Export format. Defaults to `csv`.
+      schema:
+        type: string
+        enum: [csv, xlsx, pdf]
+        default: csv
+    RedemptionIdPath:
+      name: id
+      in: path
+      required: true
+      description: RedemptionRequest ID.
+      schema:
+        type: string
+
+  responses:
+    Unauthorized:
+      description: No valid session cookie was presented.
+      content:
+        application/json:
+          schema:
+            $ref: "#/components/schemas/ErrorResponse"
+          example:
+            error: Unauthorized
+    Forbidden:
+      description: Authenticated, but the account does not have the required role/ownership.
+      content:
+        application/json:
+          schema:
+            $ref: "#/components/schemas/ErrorResponse"
+          example:
+            error: Forbidden
+    NotFound:
+      description: The requested resource does not exist.
+      content:
+        application/json:
+          schema:
+            $ref: "#/components/schemas/ErrorResponse"
+
+security:
+  - sessionCookie: []
+
+paths:
+  /api/auth/refresh:
+    post:
+      tags: [Auth]
+      summary: Rotate the refresh token and issue a new access-token session
+      description: >-
+        Called by the client-side `SessionKeepAlive` component roughly every
+        25 minutes. Reads the `refresh_token` cookie (not the session
+        cookie), rotates it, and on success re-issues both the session
+        cookie and a new refresh-token cookie. On any failure (missing,
+        expired, reused, or otherwise invalid token) both cookies are
+        cleared and the caller must log in again.
+      security:
+        - refreshCookie: []
+      responses:
+        "200":
+          description: Refresh succeeded; new `session_token` and `refresh_token` cookies are set.
+          headers:
+            Set-Cookie:
+              schema:
+                type: string
+              description: New `session_token` and `refresh_token` cookies (two separate Set-Cookie headers).
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/RefreshSuccessResponse"
+        "401":
+          description: No refresh token cookie present, or the token was invalid/expired/already used (reuse detected).
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/ErrorResponse"
+              examples:
+                missing:
+                  value: { error: "No refresh token" }
+                invalid:
+                  value: { error: "Invalid refresh token" }
+
+  /api/admin/events:
+    get:
+      tags: [Admin — Live Events]
+      summary: Subscribe to the admin live-event stream (Server-Sent Events)
+      description: >-
+        Long-lived `text/event-stream` connection used by the admin console
+        to receive real-time updates (new enquiries, payment/redemption
+        state changes, etc.) without polling. Sends a `: connected` comment
+        immediately, then forwards events as they occur, plus a `: ping`
+        heartbeat comment every 25 seconds to keep intermediaries from
+        closing the connection. Admin role required.
+      responses:
+        "200":
+          description: An open SSE stream. Remains open until the client disconnects.
+          content:
+            text/event-stream:
+              schema:
+                type: string
+                description: >-
+                  A stream of `data: <JSON AdminEvent>\n\n` frames,
+                  interleaved with `: connected` / `: ping` keep-alive
+                  comment lines.
+        "401":
+          $ref: "#/components/responses/Unauthorized"
+        "403":
+          $ref: "#/components/responses/Forbidden"
+
+  /api/admin/ledger/export:
+    get:
+      tags: [Admin — Reports]
+      summary: Export Unified Ledger entries as CSV
+      description: >-
+        Ad-hoc ledger export with optional filters, distinct from the fixed
+        report catalog at `/api/admin/reports/{reportKey}`. Admin role
+        required.
+      parameters:
+        - name: email
+          in: query
+          required: false
+          description: Filter to a single user's ledger entries by email. If provided and no matching user exists, returns 404.
+          schema:
+            type: string
+            format: email
+        - name: type
+          in: query
+          required: false
+          description: Filter by ledger transaction type.
+          schema:
+            type: string
+        - name: from
+          in: query
+          required: false
+          description: Inclusive lower bound on transaction timestamp (ISO 8601).
+          schema:
+            type: string
+            format: date
+        - name: to
+          in: query
+          required: false
+          description: Inclusive upper bound on transaction timestamp (ISO 8601).
+          schema:
+            type: string
+            format: date
+      responses:
+        "200":
+          description: CSV file download.
+          headers:
+            Content-Disposition:
+              schema:
+                type: string
+              description: 'attachment; filename="ledger-<email|all-users>-<date>.csv"'
+          content:
+            text/csv:
+              schema:
+                type: string
+        "401":
+          $ref: "#/components/responses/Unauthorized"
+        "403":
+          $ref: "#/components/responses/Forbidden"
+        "404":
+          description: No user found for the given `email`.
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/ErrorResponse"
+              example:
+                error: User not found
+
+  /api/admin/reports/{reportKey}:
+    get:
+      tags: [Admin — Reports]
+      summary: Export one of the 11 predefined admin reports
+      description: >-
+        Generates the named report (Users, Payments, Interest, Referrals,
+        Plans, Refunds, Rewards, Enquiries, General Enquiries, Revenue,
+        Audit) in the requested format. Admin role required. Corresponds to
+        BRD Section 8's named-report/export requirement.
+      parameters:
+        - $ref: "#/components/parameters/ReportKeyPath"
+        - $ref: "#/components/parameters/ReportFormatQuery"
+      responses:
+        "200":
+          description: Report file download in the requested format.
+          headers:
+            Content-Disposition:
+              schema:
+                type: string
+              description: 'attachment; filename="<reportKey>-report-<date>.<ext>"'
+          content:
+            text/csv:
+              schema:
+                type: string
+            application/vnd.openxmlformats-officedocument.spreadsheetml.sheet:
+              schema:
+                type: string
+                format: binary
+            application/pdf:
+              schema:
+                type: string
+                format: binary
+        "400":
+          description: Unsupported `format` value.
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/ErrorResponse"
+              example:
+                error: Unsupported format
+        "401":
+          $ref: "#/components/responses/Unauthorized"
+        "403":
+          $ref: "#/components/responses/Forbidden"
+        "404":
+          description: Unknown `reportKey`.
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/ErrorResponse"
+              example:
+                error: Unknown report
+
+  /api/push/subscribe:
+    get:
+      tags: [Push Notifications]
+      summary: Get the authenticated user's push-notification preference
+      responses:
+        "200":
+          description: Current preference.
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/PushStatusResponse"
+        "401":
+          $ref: "#/components/responses/Unauthorized"
+    post:
+      tags: [Push Notifications]
+      summary: Register (or refresh) a Web Push / FCM subscription for the authenticated user
+      description: >-
+        Upserts by `fcmToken`. If the token was previously registered to a
+        different account (e.g. account switch on a shared browser), it is
+        reassigned to the current session's user. No-ops (without error) if
+        the account has push notifications disabled.
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: "#/components/schemas/PushSubscribeRequest"
+      responses:
+        "200":
+          description: Subscription stored, or silently skipped because the account has push disabled.
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/PushSubscribeResponse"
+        "400":
+          description: Payload failed validation.
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/ErrorResponse"
+              example:
+                error: Invalid subscription payload
+        "401":
+          $ref: "#/components/responses/Unauthorized"
+    delete:
+      tags: [Push Notifications]
+      summary: Revoke a push subscription for the authenticated user
+      description: Marks the subscription matching `fcmToken` (and owned by the current user) as revoked.
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: "#/components/schemas/PushUnsubscribeRequest"
+      responses:
+        "200":
+          description: Revocation processed (idempotent; succeeds even if no matching subscription existed).
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/OkResponse"
+        "400":
+          description: Payload failed validation.
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/ErrorResponse"
+              example:
+                error: Invalid payload
+        "401":
+          $ref: "#/components/responses/Unauthorized"
+
+  /api/redemptions/{id}/receipt:
+    get:
+      tags: [Redemptions]
+      summary: Download the PDF receipt for an approved donation redemption
+      description: >-
+        Only valid for redemption requests in category `DONATION` with
+        status `APPROVED`. Accessible by the owning user or any Admin.
+      parameters:
+        - $ref: "#/components/parameters/RedemptionIdPath"
+      responses:
+        "200":
+          description: PDF receipt.
+          headers:
+            Content-Disposition:
+              schema:
+                type: string
+              description: 'attachment; filename="donation-receipt-<id>.pdf"'
+          content:
+            application/pdf:
+              schema:
+                type: string
+                format: binary
+        "400":
+          description: Request exists but is not an approved donation (no receipt available).
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/ErrorResponse"
+              example:
+                error: No receipt available for this request
+        "401":
+          $ref: "#/components/responses/Unauthorized"
+        "403":
+          description: Authenticated as neither the owning user nor an Admin.
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/ErrorResponse"
+              example:
+                error: Forbidden
+        "404":
+          $ref: "#/components/responses/NotFound"
