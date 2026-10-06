@@ -178,6 +178,20 @@ npm run seed                # tsx prisma/seed.ts — idempotent (uses upserts)
 - The seed script creates the demo accounts, two interest methods, two plans, a university and course,
   two donation recipients, two colleges, a franchisee plan with mappings and a gadget. Read
   `prisma/seed.ts` for the exact values.
+- **Alternative: one SQL file.** `prisma/setup.sql` creates the whole schema (35 tables, 20 enums) and
+  loads richer sample data — five users, four plans, payments (one retrying), a ledger, referrals and
+  commissions, redemption requests, notifications, content and more. Run it against an **empty**
+  database instead of the migrate + seed steps above:
+
+  ```bash
+  psql -d referral_rewards -v ON_ERROR_STOP=1 -f prisma/setup.sql
+  npx prisma generate
+  ```
+
+  It runs as a single transaction (a failure leaves nothing behind) and fails fast if the schema already
+  exists. It does not record Prisma migration history, so if you later want `prisma migrate`, baseline
+  first with `npx prisma migrate resolve --applied <migration folder>` for each folder in
+  `prisma/migrations`. The header of the file lists every demo login.
 
 ### 3.5 Run
 
